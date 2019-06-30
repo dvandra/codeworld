@@ -35,6 +35,7 @@ import CodeWorld.Color
 import CodeWorld.DrawState
 import CodeWorld.Event
 import CodeWorld.Picture
+import Control.Arrow ((&&&))
 import Control.Concurrent
 import Control.Exception
 import Control.Monad
@@ -461,11 +462,6 @@ handlePointRequest :: MonadCanvas m => IO Picture -> Point -> m (Maybe NodeId)
 handlePointRequest getPic pt = do
     drawing <- liftIO $ pictureToDrawing <$> getPic
     findTopShapeFromPoint pt drawing
-
-inspect ::
-       IO Picture -> (Bool -> IO ()) -> (Bool -> Maybe NodeId -> IO ()) -> IO ()
-inspect getPic handleActive highlight =
-    initDebugMode handleActive getPic highlight
 
 trim :: Int -> String -> String
 trim x y
@@ -1329,15 +1325,21 @@ foreign import javascript "/[&?]dhash=(.{22})/.exec(window.location.search)[1]"
 propagateErrors :: ThreadId -> IO () -> IO ()
 propagateErrors tid action = action `catch` \ (e :: SomeException) -> throwTo tid e
 
-run :: s
-    -> (Double -> s -> s)
-    -> (e -> s -> s)
-    -> (s -> Drawing CanvasM)
+type DebugReactiveProgram t m e a =
+    (R.Reflex t, R.MonadHold t m, MonadFix m, MonadReflexCreateTrigger t m) =>
+    R.Event t Double -> R.Event t e -> m (R.Dynamic t (Drawing CanvasM), a)
+
+run :: (forall t m. DebugReactiveProgram t m e a)
     -> (Double -> e)
-    -> IO (e -> IO (), IO s)
-run initial stepHandler eventHandler drawHandler injectTime = do
-    let fullStepHandler dt = stepHandler dt . eventHandler (injectTime dt)
+    -> IO (e -> IO (), a)
+run program injectTime = do
+    -- Ensure that the first frame picture doesn't expose any type errors,
+    -- before showing the canvas.  This avoids showing a blank screen when
+    -- there are deferred type errors that are effectively compile errors.
+    evaluate $ rnf $ rawDraw state
     showCanvas
+
+    let fullStepHandler dt = stepHandler dt . eventHandler (injectTime dt)
     Just window <- currentWindow
     Just doc <- currentDocument
     Just canvas <- getElementById doc ("screen" :: JSString)
@@ -1349,26 +1351,29 @@ run initial stepHandler eventHandler drawHandler injectTime = do
         setCanvasSize canvas canvas
         setCanvasSize (elementFromCanvas offscreenCanvas) canvas
         tryPutMVar needsRedraw ()
-    currentState <- newMVar initial
+    (draw, result) <- runSpiderHost $ do
+        (stepEvent, stepTrigger) <- newEventWithTriggerRef
+        (eventEvent, eventTrigger) <- newEventWithTriggerRef
+        runHostFrame $ program stepEvent eventEvent
+        
     eventHappened <- newMVar ()
     screen <- getCodeWorldContext (canvasFromElement canvas)
     let go t0 lastFrame lastStateName needsTime = do
-            pic <- drawHandler <$> readMVar currentState
-            picFrame <- makeStableName $! pic
-            when (picFrame /= lastFrame) $ do
-                rect <- getBoundingClientRect canvas
-                withScreen (elementFromCanvas offscreenCanvas) rect $
-                    drawFrame pic
-                rect <- getBoundingClientRect canvas
-                cw <- ClientRect.getWidth rect
-                ch <- ClientRect.getHeight rect
-                when (cw > 0 && ch > 0) $ canvasDrawImage
-                    screen
-                    (elementFromCanvas offscreenCanvas)
-                    0
-                    0
-                    (round cw)
-                    (round ch)
+            --TODO: Use UniqDynamic for deduplication
+            pic <- runSpiderHost $ sample $ current draw
+            rect <- getBoundingClientRect canvas
+            withScreen (elementFromCanvas offscreenCanvas) rect $
+                drawFrame pic
+            rect <- getBoundingClientRect canvas
+            cw <- ClientRect.getWidth rect
+            ch <- ClientRect.getHeight rect
+            when (cw > 0 && ch > 0) $ canvasDrawImage
+                screen
+                (elementFromCanvas offscreenCanvas)
+                0
+                0
+                (round cw)
+                (round ch)
             t1 <-
                 case needsTime of
                     True -> do
@@ -1400,7 +1405,7 @@ run initial stepHandler eventHandler drawHandler injectTime = do
                 modifyMVarIfDifferent currentState (eventHandler event)
             when changed $ void $ tryPutMVar eventHappened ()
         getState = readMVar currentState
-    return (sendEvent, getState)
+    return (sendEvent, result)
 
 data DebugState = DebugState
     { debugStateActive :: Bool
@@ -1457,51 +1462,6 @@ inRight f ab = unsafePerformIO $ do
   let b' = f b
   bName' <- makeStableName $! b'
   return $ if bName == bName' then ab else (a, b')
-
-foreign import javascript interruptible "window.dummyVar = 0;"
-  waitForever :: IO ()
-
--- Wraps the event and state from run so they can be paused by pressing the Inspect
--- button.
-runInspect
-    :: s
-    -> (Double -> s -> s)
-    -> (Event -> s -> s)
-    -> (s -> Picture)
-    -> (s -> Picture)
-    -> IO ()
-runInspect initial step event draw rawDraw = do
-    -- Ensure that the first frame picture doesn't expose any type errors,
-    -- before showing the canvas.  This avoids showing a blank screen when
-    -- there are deferred type errors that are effectively compile errors.
-    evaluate $ rnf $ rawDraw initial
-
-    Just doc <- currentDocument
-    Just canvas <- getElementById doc ("screen" :: JSString)
-    let debugInitial = (debugStateInit, initial)
-        debugStep dt s@(debugState, _) =
-            case debugStateActive debugState of
-                True -> s
-                False -> inRight (step dt) s
-        debugEvent evt s@(debugState, _) =
-            case (debugStateActive debugState, evt) of
-                (_, Left e) -> inLeft (updateDebugState e) s
-                (True, _) -> s
-                (_, Right e) -> inRight (event e) s
-        debugDraw (debugState, s) =
-            case debugStateActive debugState of
-                True -> drawDebugState debugState (pictureToDrawing (rawDraw s))
-                False -> pictureToDrawing (draw s)
-        debugRawDraw (_debugState, s) = rawDraw s
-    (sendEvent, getState) <-
-        run debugInitial debugStep debugEvent debugDraw (Right . TimePassing)
-    let pauseEvent True = sendEvent $ Left DebugStart
-        pauseEvent False = sendEvent $ Left DebugStop
-        highlightSelectEvent True n = sendEvent $ Left (HighlightEvent n)
-        highlightSelectEvent False n = sendEvent $ Left (SelectEvent n)
-    onEvents canvas (sendEvent . Right)
-    inspect (debugRawDraw <$> getState) pauseEvent highlightSelectEvent
-    waitForever
 
 -- Given a drawing, highlight the first node and select second node. Both recolor
 -- the nodes, but highlight also brings the node to the top.
@@ -1567,6 +1527,57 @@ replaceDrawNode n with drawing = either Just (const Nothing) $ go n drawing
                 go (succ n) $ Drawings drs
     mapLeft :: (a -> b) -> Either a c -> Either b c
     mapLeft f = either (Left . f) Right
+
+foreign import javascript interruptible "window.dummyVar = 0;"
+    waitForever :: IO ()
+
+-- Wraps the event and state from run so they can be paused by pressing the Inspect
+-- button.
+runInspect :: ReactiveProgram t m -> IO ()
+runInspect program = do
+    let debugInitial = (debugStateInit, initial)
+        debugStep dt s@(debugState, _) =
+            case debugStateActive debugState of
+                True -> s
+                False -> inRight (step dt) s
+        debugEvent evt s@(debugState, _) =
+            case (debugStateActive debugState, evt) of
+                (_, Left e) -> inLeft (updateDebugState e) s
+                (True, _) -> s
+                (_, Right e) -> inRight (event e) s
+        debugDraw (debugState, s) =
+            case debugStateActive debugState of
+                True -> drawDebugState debugState (pictureToDrawing (rawDraw s))
+                False -> pictureToDrawing (draw s)
+        debugRawDraw (_debugState, s) = rawDraw s
+    (sendEvent, getState) <-
+        run debugInitial debugStep debugEvent debugDraw (Right . TimePassing)
+    let pauseEvent True = sendEvent $ Left DebugStart
+        pauseEvent False = sendEvent $ Left DebugStop
+        highlightSelectEvent True n = sendEvent $ Left (HighlightEvent n)
+        highlightSelectEvent False n = sendEvent $ Left (SelectEvent n)
+
+    Just doc <- currentDocument
+    Just canvas <- getElementById doc ("screen" :: JSString)
+    onEvents canvas (sendEvent . Right)
+    initDebugMode pauseEvent (debugRawDraw <$> getState) highlightSelectEvent
+    waitForever
+
+type ReactiveProgram t m =
+    (R.Reflex t, R.MonadHold t m, MonadFix m) =>
+    R.Event t Double -> R.Event t Event -> m (R.Dynamic t (Drawing CanvasM, Picture))
+
+reactiveProgram
+    :: s
+    -> (Double -> s -> s)
+    -> (Event -> s -> s)
+    -> (s -> Picture)
+    -> (s -> Picture)
+    -> ReactiveProgram t m
+reactiveProgram state step event draw rawDraw = \ stepEvent eventEvent -> do
+    dynState <- R.accum (flip ($)) state $ mergeWith (.)
+        [ step <$> stepEvent, event <$> eventEvent ]
+    return ((pictureToDrawing (draw s) &&& rawDraw s) <$> dynState)
 
 #else
 
